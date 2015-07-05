@@ -2,6 +2,7 @@
 The MIT License (MIT)
 
 Copyright (c) 2015 Maxim Zhurovich <zhurovich@gmail.com>
+Copyright (c) 2015 Dmitry "Dima" Korolev <dmitry.korolev@gmail.com>
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -41,7 +42,9 @@ struct Cell {
   Cell() = delete;
   Cell(const Space& space) {
     for (const auto& dim : space.dimensions) {
-      coordinates.emplace_back(dim.name, NOT_SET_BIN_NAME);
+      coordinates.emplace_back(
+          dim.name,
+          std::string(dim.name) == DEVICE_DIMENSION_NAME ? DEVICE_UNSPECIFIED_BIN_NAME : NONE_BIN_NAME);
     }
   }
 
@@ -102,7 +105,12 @@ int main(int argc, char** argv) {
         Dimension* dim = input.space.DimensionByName(dimension_name);
         assert(dim);
         bin_name = dim->BinNameByValue(feature_counter.second);
-        assert(!bin_name.empty());
+        if (bin_name.empty()) {
+          std::cerr << "FATAL ERROR: No bin assignment for " << feature_counter.second << " within "
+                    << dim->name << std::endl;
+          std::cerr << JSON(*dim) << std::endl;
+          std::exit(-1);
+        }
       }
       cell.SetCoordinate(dimension_name, bin_name);
     }

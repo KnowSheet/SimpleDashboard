@@ -2,6 +2,7 @@
 The MIT License (MIT)
 
 Copyright (c) 2015 Dmitry "Dima" Korolev <dmitry.korolev@gmail.com>
+Copyright (c) 2015 Maxim Zhurovich <zhurovich@gmail.com>
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -43,6 +44,9 @@ SOFTWARE.
 DEFINE_int32(port, 3000, "Port to spawn the dashboard on.");
 DEFINE_string(route, "/", "The route to serve the dashboard on.");
 DEFINE_string(output_uri_prefix, "http://localhost", "The prefix for the URI-s output by the server.");
+DEFINE_bool(enable_graceful_shutdown,
+            false,
+            "Set to true if the binary is only spawned to generate cube/insights data.");
 
 using bricks::strings::Printf;
 using bricks::strings::ToLower;
@@ -395,14 +399,17 @@ struct Splitter {
             // map<FEATURE, map<FEATURE_COUNT_IN_SESSION, NUMBER_OF_SESSION_CONTAINING_THIS_COUNT>>
             std::map<std::string, std::map<size_t, size_t>> feature_stats;
 
+            // Populate all the sessions.
             const auto& accessor = yoda::Matrix<AggregatedSessionInfo>::Accessor(data);
             for (const auto& sessions_per_group : accessor.Cols()) {
               for (const auto& individual_session : sessions_per_group) {
                 sessions.resize(sessions.size() + 1);
                 CubeGeneratorInput::Session& output_session = sessions.back();
                 output_session.id = individual_session.sid;
+                // Dedicated handling for the "number of seconds" dimension.
                 output_session.feature_count[TIME_DIMENSION_NAME] = individual_session.number_of_seconds;
                 ++feature_stats[TIME_DIMENSION_NAME][individual_session.number_of_seconds];
+                // Generic handling for all tracked dimensions.
                 for (const auto& feature_counter : individual_session.counters) {
                   const std::string& feature = feature_counter.first;
                   output_session.feature_count[feature] = feature_counter.second;
@@ -423,8 +430,7 @@ struct Splitter {
                 Bin first_bin("< " + std::to_string(a), a, Bin::RangeType::LESS);
                 time_dimension.bins.push_back(first_bin);
               }
-              Bin bin_range(
-                  std::to_string(a) + " - " + std::to_string(b), a, b, Bin::RangeType::INTERVAL);
+              Bin bin_range(std::to_string(a) + " - " + std::to_string(b), a, b, Bin::RangeType::INTERVAL);
               time_dimension.bins.push_back(bin_range);
               if (i == second_marks.size() - 2u) {
                 Bin last_bin("> " + std::to_string(b), b, Bin::RangeType::GREATER);
@@ -432,7 +438,7 @@ struct Splitter {
               }
             }
             dimensions.emplace_back(DEVICE_DIMENSION_NAME);
-            dimensions.back().bins.emplace_back(NOT_SET_BIN_NAME);
+            dimensions.back().bins.emplace_back(DEVICE_UNSPECIFIED_BIN_NAME);
 
             // Fill dimensions info in the response.
             for (const auto& cit : feature_stats) {
@@ -448,7 +454,7 @@ struct Splitter {
               if (dim_bin.second.empty()) {
                 assert(!dim_in_space);
                 Dimension dim(dim_bin.first);
-                dim.bins.emplace_back(NOT_SET_BIN_NAME);
+                dim.bins.emplace_back(NONE_BIN_NAME);
                 dim.SmartCreateBins(cit.second);
                 dimensions.push_back(dim);
               } else {
@@ -531,10 +537,11 @@ struct Splitter {
 struct Listener {
   DB& db;
   Splitter splitter;
+  std::atomic_size_t total_processed_entries;
 
-  explicit Listener(DB& db) : db(db), splitter(db) {}
+  explicit Listener(DB& db) : db(db), splitter(db), total_processed_entries(0) {}
 
-  inline bool operator()(const EID eid) {
+  inline bool operator()(const EID eid, size_t index) {
     db.Transaction(
            [this, eid](typename DB::T_DATA data) {
              // Yep, it's an extra, synchronous, lookup. But this solution is cleaner data-wise.
@@ -552,6 +559,7 @@ struct Listener {
                splitter.TickEvent(static_cast<uint64_t>(eid) / 1000, std::ref(data));
              }
            }).Go();
+    total_processed_entries = index + 1;
     return true;
   }
 };
@@ -646,16 +654,59 @@ int main(int argc, char** argv) {
   Listener listener(db);
   auto scope = raw.SyncSubscribe(listener);
 
+  std::atomic_size_t total_stream_entries(0);
+  std::atomic_bool done_processing_stdin(false);
+  std::atomic_bool graceful_shutdown(false);
+
+  if (FLAGS_enable_graceful_shutdown) {
+    HTTP(FLAGS_port).Register(FLAGS_route + "graceful_wait",
+                              [&done_processing_stdin, &total_stream_entries, &listener](Request r) {
+      while (!done_processing_stdin) {
+        const size_t total = total_stream_entries;
+        const size_t processed = listener.total_processed_entries;
+        if (total) {
+          std::cerr << processed * 100 / total << "% (" << processed << " / " << total
+                    << ") entries processed.\n";
+        } else {
+          std::cerr << "Not done receiving entries from standard input.\n";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      }
+      std::cerr << "All entries from standard input have been successfully processed.\n";
+      r("Completed.\n");
+    });
+    HTTP(FLAGS_port).Register(FLAGS_route + "graceful_shutdown", [&graceful_shutdown](Request r) {
+      graceful_shutdown = true;
+      r("Bye.\n");
+    });
+  }
+
   // Read from standard input forever.
   // The rest of the logic is handled asynchronously, by the corresponding listeners.
-  BlockingParseLogEventsAndInjectIdleEventsFromStandardInput<MidichloriansEvent,
-                                                             MidichloriansEventWithTimestamp>(
-      raw, db, FLAGS_port, FLAGS_route);
+  total_stream_entries =
+      BlockingParseLogEventsAndInjectIdleEventsFromStandardInput<MidichloriansEvent,
+                                                                 MidichloriansEventWithTimestamp>(
+          raw, db, FLAGS_port, FLAGS_route) +
+      1;
 
-  // Production code should never reach this point.
-  // For non-production code, print an explanatory message before terminating.
-  // Not terminating would be a bad idea, since it sure will break production one day. -- D.K.
-  std::cerr << "Note: This binary is designed to run forever, and/or be restarted in an infinite loop.\n";
-  std::cerr << "In test mode, to run against a small subset of data, consider `tail -f`-ing the input file.\n";
-  return -1;
+  if (FLAGS_enable_graceful_shutdown) {
+    while (listener.total_processed_entries != total_stream_entries) {
+      ;  // Spin lock.
+    }
+    done_processing_stdin = true;
+    scope.Join();
+    // `curl` "/graceful_shutdown" to stop.
+    while (!graceful_shutdown) {
+      ;  // Spin lock.
+    }
+    return 0;
+  } else {
+    // Production code should never reach this point.
+    // For non-production code, print an explanatory message before terminating.
+    // Not terminating would be a bad idea, since it sure will break production one day. -- D.K.
+    std::cerr << "Note: This binary is designed to run forever, and/or be restarted in an infinite loop.\n";
+    std::cerr << "In test mode, to run against a small subset of data, consider `tail -n +1 -f input.txt`,\n";
+    std::cerr << "or using the `--graceful_shutdown=true` mode, see `./run.sh` for more details.\n";
+    return -1;
+  }
 }

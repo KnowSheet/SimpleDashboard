@@ -136,7 +136,17 @@ struct EventWithTimestamp : yoda::Padawan {
         void operator()(iOSFocusEvent) {}
         void operator()(const iOSGenericEvent& e) {
           if (e.event != "AppOpen" && e.event != "Backgrounded" && e.event != "MemoryWarning") {
-            gist = "iOSGenericEvent:" + e.source + ":" + e.event;
+            // Simpler format for better human readability. -- D.K.
+            // gist = "iOSGenericEvent:" + e.source + ":" + e.event;
+            if (e.event.empty()) {
+              gist = '@' + e.source;
+            } else {
+              if (e.source.empty() || e.source == "CTFOApp.iOS" || e.source == "trackEvent") {
+                gist = e.event;
+              } else {
+                gist = e.event + " @ " + e.source;
+              }
+            }
             // Code below can be used to generated more detailed data.
             // Hint: DO NOT USE `|` as a separator in the dimension name - it interferes with cube browser
             // format.
